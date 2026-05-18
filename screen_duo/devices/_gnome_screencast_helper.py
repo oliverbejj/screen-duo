@@ -1,13 +1,8 @@
 """Holds a D-Bus connection open for a GNOME Shell screencast.
 
-GNOME Shell stops a screencast as soon as the caller's D-Bus connection
-disconnects, so a one-shot `gdbus call` cannot drive a recording. This script
-runs as a long-lived subprocess: it starts the screencast, reports the actual
-output filename on stdout, then blocks until the parent writes a line to stdin
-(or closes it), at which point it stops the screencast and exits.
-
-It must run on a python3 that has PyGObject (gi) — typically the system
-interpreter, not necessarily the one running the app.
+Usage:
+  Full desktop:  python3 _gnome_screencast_helper.py <template> <framerate>
+  Single monitor: python3 _gnome_screencast_helper.py <template> <x> <y> <w> <h> <framerate>
 """
 import sys
 
@@ -20,7 +15,15 @@ IFACE = "org.gnome.Shell.Screencast"
 
 def main() -> int:
     template = sys.argv[1]
-    framerate = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+
+    # Detect area vs full-desktop mode by argument count
+    if len(sys.argv) >= 7:
+        x, y, w, h = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+        framerate = int(sys.argv[6])
+        area_mode = True
+    else:
+        framerate = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+        area_mode = False
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     options = {
@@ -29,12 +32,20 @@ def main() -> int:
     }
 
     try:
-        result = bus.call_sync(
-            DEST, PATH, IFACE, "Screencast",
-            GLib.Variant("(sa{sv})", (template, options)),
-            GLib.VariantType("(bs)"),
-            Gio.DBusCallFlags.NONE, 10000, None,
-        )
+        if area_mode:
+            result = bus.call_sync(
+                DEST, PATH, IFACE, "ScreencastArea",
+                GLib.Variant("(iiiisa{sv})", (x, y, w, h, template, options)),
+                GLib.VariantType("(bs)"),
+                Gio.DBusCallFlags.NONE, 10000, None,
+            )
+        else:
+            result = bus.call_sync(
+                DEST, PATH, IFACE, "Screencast",
+                GLib.Variant("(sa{sv})", (template, options)),
+                GLib.VariantType("(bs)"),
+                Gio.DBusCallFlags.NONE, 10000, None,
+            )
     except GLib.Error as exc:
         sys.stdout.write(f"ERR {exc.message}\n")
         sys.stdout.flush()
@@ -49,7 +60,6 @@ def main() -> int:
     sys.stdout.write(f"OK {filename}\n")
     sys.stdout.flush()
 
-    # Block here, keeping the bus connection alive, until the parent signals.
     sys.stdin.readline()
 
     try:

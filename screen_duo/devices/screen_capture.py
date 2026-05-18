@@ -12,8 +12,22 @@ class Display:
     x: int
     y: int
 
+    def label(self) -> str:
+        """Human-readable label, replacing opaque XWayland names."""
+        if self.name.startswith("XWAYLAND"):
+            try:
+                n = int(self.name[len("XWAYLAND"):]) + 1
+            except ValueError:
+                n = 1
+            tag = f"Screen {n}"
+        else:
+            tag = self.name
+        primary = self.x == 0 and self.y == 0
+        suffix = " (primary)" if primary else f" @ {self.x},{self.y}"
+        return f"{tag}  {self.width}x{self.height}{suffix}"
+
     def __str__(self):
-        return f"{self.name} ({self.width}x{self.height})"
+        return self.label()
 
 
 def is_wayland() -> bool:
@@ -38,6 +52,7 @@ def _list_displays_x11() -> list[Display]:
 
 
 def _list_displays_wayland() -> list[Display]:
+    # wlr-randr: works on wlroots compositors (Sway, Hyprland)
     try:
         out = subprocess.check_output(["wlr-randr"], text=True, stderr=subprocess.DEVNULL)
         displays = []
@@ -57,13 +72,27 @@ def _list_displays_wayland() -> list[Display]:
             return displays
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
-    # Fall back: portal will show its own picker, use a sentinel
-    return [Display("Screen (portal picker)", 0, 0, 0, 0)]
+
+    # xrandr via XWayland: works on GNOME Wayland sessions
+    try:
+        out = subprocess.check_output(["xrandr", "--query"], text=True, stderr=subprocess.DEVNULL)
+        displays = []
+        for line in out.splitlines():
+            match = re.match(r"^(\S+) connected.*?(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+            if match:
+                name, w, h, x, y = match.groups()
+                displays.append(Display(name, int(w), int(h), int(x), int(y)))
+        if displays:
+            return displays
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    return [Display("Screen", 0, 0, 0, 0)]
 
 
 def start_recording(display: Display, output_path: str, framerate: int = 30) -> subprocess.Popen:
     if is_wayland():
-        return _start_wayland(output_path, framerate)
+        return _start_wayland(display, output_path, framerate)
     return _start_x11(display, output_path, framerate)
 
 
@@ -155,12 +184,17 @@ def _gnome_screencast_available() -> bool:
         return False
 
 
-def _start_gnome_screencast(output_path: str, framerate: int) -> _GnomeScreencast:
+def _start_gnome_screencast(display: Display, output_path: str, framerate: int) -> _GnomeScreencast:
     py = _find_gi_python()
     if py is None:
         raise RuntimeError("No python3 with PyGObject (gi) found for GNOME screencast")
+    args = [py, _HELPER_SCRIPT, output_path]
+    if display.width > 0 and display.height > 0:
+        # Area mode: record only the selected monitor's region
+        args += [str(display.x), str(display.y), str(display.width), str(display.height)]
+    args.append(str(framerate))
     proc = subprocess.Popen(
-        [py, _HELPER_SCRIPT, output_path, str(framerate)],
+        args,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     line = proc.stdout.readline().decode(errors="replace").strip()
@@ -170,11 +204,14 @@ def _start_gnome_screencast(output_path: str, framerate: int) -> _GnomeScreencas
     return _GnomeScreencast(proc, output_path, line[3:])
 
 
-def _start_wayland(output_path: str, framerate: int):
+def _start_wayland(display: Display, output_path: str, framerate: int):
     if _gnome_screencast_available():
-        return _start_gnome_screencast(output_path, framerate)
+        return _start_gnome_screencast(display, output_path, framerate)
     # wf-recorder works on wlroots compositors (Sway, Hyprland), not GNOME.
     cmd = ["wf-recorder", "--codec", "libx264", "-f", output_path]
+    # Pass the output name when it's a real connector (not an XWayland alias)
+    if display.name and not display.name.startswith("XWAYLAND"):
+        cmd += ["--output", display.name]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
