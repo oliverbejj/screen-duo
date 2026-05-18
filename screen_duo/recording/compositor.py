@@ -3,8 +3,6 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 
-import cv2
-
 from screen_duo.recording.sync import compute_offset, build_trim_args
 
 
@@ -14,23 +12,6 @@ class OverlayBox:
     y: int
     width: int
     height: int
-
-
-def _process_phone_video(phone_path: str, box: OverlayBox, out_path: str):
-    cap = cv2.VideoCapture(phone_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (box.width, box.height))
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        writer.write(cv2.resize(frame, (box.width, box.height)))
-
-    cap.release()
-    writer.release()
 
 
 def _trim_and_concat(paths: list[str], trim_seconds: float, output_path: str):
@@ -96,22 +77,18 @@ def composite(
     _trim_and_concat(phone_segments, phone_trim, phone_full)
 
     if progress_callback:
-        progress_callback("Applying face tracking…")
-
-    phone_cropped = os.path.join(tmp_dir, "phone_cropped.mp4")
-    _process_phone_video(phone_full, box, phone_cropped)
-
-    if progress_callback:
         progress_callback("Compositing final video…")
 
+    bw, bh = box.width, box.height
     subprocess.run(
         [
             "ffmpeg", "-y",
             "-i", screen_full,
-            "-i", phone_cropped,
+            "-i", phone_full,
             "-filter_complex",
-            f"[1:v]scale={box.width}:{box.height}[phone];[0:v][phone]overlay={box.x}:{box.y}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+            f"crop={bw}:{bh}[phone];[0:v][phone]overlay={box.x}:{box.y}",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "17",
             "-c:a", "copy",
             output_path,
         ],
@@ -120,8 +97,7 @@ def composite(
         check=True,
     )
 
-    # Cleanup temp files
-    for f in [screen_full, phone_full, phone_cropped]:
+    for f in [screen_full, phone_full]:
         if os.path.exists(f):
             os.remove(f)
     os.rmdir(tmp_dir)
