@@ -6,57 +6,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 screen-duo is a Linux desktop tool for recording your screen and phone camera simultaneously, syncing them, and compositing the phone feed (head cam) as an overlay on the screen recording.
 
-**User flow:** Launch app → select display → phone camera starts automatically via ADB → preview overlay position → record → pause/resume → stop → auto-composite to MP4.
+**User flow:** Launch app → select display → click "Connect iPhone" → open URL in Safari → tap Allow → position overlay → record → pause/resume → stop → auto-composite to MP4.
 
 ## Architecture
 
 The project is split into three layers:
 
 **1. Device layer** (`devices/`)
-- `screen_capture.py` — captures the selected display. Auto-detects X11 (ffmpeg `x11grab`) vs Wayland (PipeWire via `xdg-desktop-portal`). Detection: check `$WAYLAND_DISPLAY`.
-- `phone_capture.py` — controls the phone camera over USB via ADB + `scrcpy --video-source=camera`. Exposes the feed as a V4L2 device via `v4l2loopback`. ADB is used to start/stop recording programmatically.
+- `screen_capture.py` — captures the selected display. Auto-detects X11 (ffmpeg `x11grab`) vs Wayland (`$WAYLAND_DISPLAY`). On Wayland it further branches: GNOME/Mutter uses the `org.gnome.Shell.Screencast` D-Bus API (Mutter does not implement `wlr-screencopy`, so `wf-recorder` cannot work there); wlroots compositors (Sway, Hyprland) use `wf-recorder`.
+- `phone_capture.py` — probes and lists `/dev/video*` devices, checks if a device has a live feed, and records from a v4l2 device to a file via ffmpeg. Does not control any hardware directly; it reads whatever is already on the v4l2 device.
+- `webrtc_server.py` — the iPhone camera bridge. Runs a two-port local server: HTTP on :8080 (serves a `.mobileconfig` CA cert profile for one-time installation on the iPhone) and HTTPS on :8443 (serves the WebRTC camera page). Received frames are piped from aiortc into a v4l2loopback device via ffmpeg subprocess.
+- `iphone_bridge.py` — fallback RTSP/MJPEG/RTMP bridge. Detects the v4l2loopback device and starts an ffmpeg process piping any URL stream into it. Not used by the main UI (which uses WebRTC), but available as a utility.
 
 **2. Recording layer** (`recording/`)
-- `session.py` — orchestrates a recording session. Manages segments (pause = stop both feeds simultaneously, resume = start new segment pair). Uses simultaneous ADB + ffmpeg triggers for sync.
+- `session.py` — orchestrates a recording session. Manages segments (pause = stop both feeds simultaneously, resume = start new segment pair). Uses simultaneous ffmpeg triggers for sync.
 - `sync.py` — post-recording sync correction. At the start of each segment, a clapper flash is shown on screen and a beep plays through the phone speaker. `sync.py` finds these markers in each segment pair to compute drift and align them.
 - `compositor.py` — post-recording ffmpeg compositing. Concatenates segments (lossless via `concat` demuxer), then overlays the phone feed on the screen recording. Output: H.264/MP4.
+- `clapper.py` — triggers the clapper flash (full-screen white `FlashWidget`) and audio beep.
 
 **3. UI layer** (`ui/`)
 - Built with PySide6.
-- `main_window.py` — display selector, record/pause/stop controls, live preview.
-- `overlay_widget.py` — draggable box the user positions on the preview (default: top-right). Within that box, OpenCV face tracking crops the phone feed to follow the head.
+- `main_window.py` — display selector, camera dropdown, iPhone WebRTC connect controls (shows cert URL + camera URL), record/pause/stop controls, and a 5 fps screen preview. Camera probing and device checks run on background threads to keep the UI responsive.
+- `overlay_widget.py` — draggable box the user positions on the preview (default: top-right). Phone feed is scaled to fill the box. Capture runs on a background thread (not the Qt main thread) to avoid UI lag.
 - Preview during recording is a lightweight OpenCV overlay, not the final composited render.
 
 ## Key constraints
 
 - **Pause is segment-based**: pause hard-stops both recordings; resume starts new segments. `ffmpeg concat` stitches segments losslessly at the end. Sync is preserved because each segment pair starts simultaneously.
 - **Compositing is post-recording only**: ffmpeg runs at full speed after stop, not in real-time during recording (avoids dropped frames).
-- **Face tracking scope**: OpenCV tracks the face *within* the user-positioned overlay box only — it crops/pans the phone feed inside the box, it does not move the box itself.
-- **Phone connection**: iPhone via OBS virtual camera. OBS runs with `obs-ios-camera-source` plugin and outputs to a v4l2loopback device. screen-duo reads from that device. The user must have OBS running with virtual camera enabled before hitting Record. `phone_capture.py` does not launch OBS — it just detects a live v4l2 feed.
+- **Phone preview stops during recording**: the OpenCV preview (`overlay_widget.py`) is stopped when ffmpeg starts recording from the same v4l2 device, to avoid a dual-consumer conflict. It restarts when recording returns to idle.
+- **Phone connection**: iPhone via WebRTC. screen-duo runs a two-port local server (`webrtc_server.py`). HTTP :8080 serves a `.mobileconfig` CA cert profile — iPhone installs this once in Settings to trust our local CA. HTTPS :8443 serves the camera page — iPhone opens it in Safari, taps Start Camera, taps Allow, and streams. Frames arrive via aiortc, are piped into a v4l2loopback device via ffmpeg, and the rest of the app reads from that device as a normal v4l2 camera. No app, no account, no watermark.
 
 ## Tech stack
 
 - Python 3.10+
 - PySide6 (UI)
-- OpenCV (`opencv-python`) — face tracking within overlay box
-- ffmpeg via subprocess — screen capture (x11grab/pipewire), video concat, compositing
-- OBS + obs-ios-camera-source — iPhone camera bridge (user-managed, not launched by app)
-- v4l2loopback — OBS virtual camera output device
+- OpenCV (`opencv-python`) — phone camera preview in overlay widget (background thread)
+- ffmpeg via subprocess — screen capture (x11grab/wf-recorder), phone recording (v4l2 input), video concat, compositing, WebRTC frame bridge
+- aiortc + aiohttp — WebRTC server: receives iPhone camera stream over local HTTPS
+- v4l2loopback — virtual v4l2 device; WebRTC bridge writes frames here, recording reads from here
+- scipy — used in `sync.py` for sync correction
 
 ## Development setup
 
 ```bash
 pip install -r requirements.txt
 # System deps
-sudo apt install v4l2loopback-dkms ffmpeg obs-studio
+sudo apt install v4l2loopback-dkms ffmpeg
 sudo modprobe v4l2loopback
 ```
 
-**iPhone setup (one-time):**
-1. Install [obs-ios-camera-source](https://github.com/wtsnz/obs-ios-camera-source) OBS plugin
-2. Install "Camera for OBS Studio" app on your iPhone (free, App Store)
-3. In OBS: add iOS Camera source → enable Virtual Camera
-4. Launch screen-duo — it auto-detects the live v4l2 feed
+**iPhone setup (one-time — < 2 minutes, never repeated):**
+1. Make sure iPhone and laptop are on the same WiFi
+2. In screen-duo: click **Connect iPhone** — two URLs appear
+3. Open the **cert URL** (`http://...:8080/ca.mobileconfig`) in Safari → tap **Allow**
+4. **Settings → General → VPN & Device Management → screen-duo → Install**
+5. **Settings → General → About → Certificate Trust Settings** → enable **screen-duo CA**
+6. Open the **camera URL** (`https://...:8443`) in Safari → tap **Start Camera** → tap **Allow**
+7. Overlay in screen-duo goes green — streaming
+
+From then on, only step 6 is needed. The cert stays trusted permanently.
 
 Run the app:
 ```bash
@@ -65,7 +74,7 @@ python -m screen_duo
 
 ## Git workflow
 
-After completing any meaningful unit of work — a new file, a bug fix, a refactor — commit and push soon after so work and status are never stranded only on one machine. Prefer one logical change per commit rather than mixing unrelated edits.
+Commit and push once the change has been confirmed working (tested by the user or verified via the app). Do not commit speculatively before testing. Prefer one logical change per commit rather than mixing unrelated edits.
 
 ```bash
 git add <specific files>
@@ -74,10 +83,11 @@ git push
 ```
 
 Commit message rules:
-- Imperative mood: "add compositor face tracking" not "added" or "adds"
+- Imperative mood: "fix overlay thread blocking" not "fixed" or "fixes"
 - One line, under 72 chars
 - No generic messages like "update files" or "fix stuff"
+- No `Co-Authored-By` lines
 
 Push after every commit. This is a solo project with no PR review process — push directly to `main`.
 
-**Documentation:** When you change architecture, setup, or constraints above, update this file (or the doc that owns that information) in the same cadence — ideally the same commit — so humans and coding agents stay aligned. Project agent skills live under `.cursor/skills/` and `.claude/skills/` (`my-init`, `git-commit-and-push`, `keep-context-docs-current`): use `my-init` for `/init`-style onboarding that ties into the other two workflows.
+**Documentation:** When you change architecture, setup, or constraints above, update this file in the same commit so the next session has accurate ground truth. Shared agent skills (`git-commit-and-push`, `keep-context-docs-current`, `my-init`) live globally under **`~/.cursor/skills/`** (Cursor) and **`~/.claude/skills/`** (Claude Code).

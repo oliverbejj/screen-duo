@@ -81,13 +81,107 @@ def _start_x11(display: Display, output_path: str, framerate: int) -> subprocess
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
-def _start_wayland(output_path: str, framerate: int) -> subprocess.Popen:
-    # wf-recorder works on wlroots compositors (Sway, Hyprland, GNOME via xdg-desktop-portal)
+_SCREENCAST_DEST = "org.gnome.Shell.Screencast"
+_SCREENCAST_PATH = "/org/gnome/Shell/Screencast"
+_HELPER_SCRIPT = os.path.join(os.path.dirname(__file__), "_gnome_screencast_helper.py")
+
+
+class _GnomeScreencast:
+    """Handle for a recording driven by the org.gnome.Shell.Screencast D-Bus
+    API. GNOME stops the recording when the caller's D-Bus connection vanishes,
+    so a helper subprocess holds that connection open for the segment's life."""
+
+    def __init__(self, proc: subprocess.Popen, requested_path: str, actual_path: str):
+        self._proc = proc
+        self._requested_path = requested_path
+        self._actual_path = actual_path
+
+    def stop(self) -> None:
+        try:
+            self._proc.stdin.write(b"stop\n")
+            self._proc.stdin.flush()
+            self._proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self._proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+            self._proc.wait()
+        if self._actual_path != self._requested_path and os.path.exists(self._actual_path):
+            os.replace(self._actual_path, self._requested_path)
+
+
+_gi_python: str | None | bool = False  # False = not yet probed
+
+
+def _find_gi_python() -> str | None:
+    """Locate a python3 with PyGObject (gi) for the screencast helper. The app
+    itself may run on an interpreter without gi, so we probe the system one."""
+    global _gi_python
+    if _gi_python is not False:
+        return _gi_python
+    _gi_python = None
+    probe = "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"
+    for exe in ("/usr/bin/python3", "/usr/bin/python3.12", "/usr/bin/python3.11", "python3"):
+        try:
+            subprocess.check_call(
+                [exe, "-c", probe],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
+            _gi_python = exe
+            break
+        except (subprocess.SubprocessError, OSError):
+            continue
+    return _gi_python
+
+
+def _gnome_screencast_available() -> bool:
+    """GNOME's Mutter does not implement wlr-screencopy (so wf-recorder fails);
+    it exposes screen recording over D-Bus instead."""
+    if _find_gi_python() is None:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["gdbus", "call", "--session",
+             "--dest", _SCREENCAST_DEST,
+             "--object-path", _SCREENCAST_PATH,
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             _SCREENCAST_DEST, "ScreencastSupported"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        return "true" in out
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def _start_gnome_screencast(output_path: str, framerate: int) -> _GnomeScreencast:
+    py = _find_gi_python()
+    if py is None:
+        raise RuntimeError("No python3 with PyGObject (gi) found for GNOME screencast")
+    proc = subprocess.Popen(
+        [py, _HELPER_SCRIPT, output_path, str(framerate)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    line = proc.stdout.readline().decode(errors="replace").strip()
+    if not line.startswith("OK "):
+        proc.terminate()
+        raise RuntimeError(f"GNOME screencast failed to start: {line or 'no response'}")
+    return _GnomeScreencast(proc, output_path, line[3:])
+
+
+def _start_wayland(output_path: str, framerate: int):
+    if _gnome_screencast_available():
+        return _start_gnome_screencast(output_path, framerate)
+    # wf-recorder works on wlroots compositors (Sway, Hyprland), not GNOME.
     cmd = ["wf-recorder", "--codec", "libx264", "-f", output_path]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
-def stop_recording(proc: subprocess.Popen) -> None:
+def stop_recording(proc) -> None:
+    if isinstance(proc, _GnomeScreencast):
+        proc.stop()
+        return
     if is_wayland():
         import signal
         proc.send_signal(signal.SIGINT)
