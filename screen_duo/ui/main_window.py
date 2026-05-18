@@ -1,8 +1,9 @@
 import threading
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QImage, QPixmap, QColor
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -16,7 +17,9 @@ from PySide6.QtWidgets import (
 )
 
 from screen_duo.devices import phone_capture
+from screen_duo.devices.iphone_bridge import find_loopback_device
 from screen_duo.devices.screen_capture import list_displays, Display
+from screen_duo.devices.webrtc_server import WebRTCServer
 from screen_duo.recording.session import RecordingSession, State
 from screen_duo.ui.overlay_widget import OverlayWidget
 
@@ -26,6 +29,10 @@ class _Signals(QObject):
     progress = Signal(str)
     done = Signal(str)
     error = Signal(str)
+    camera_probe_done = Signal(str, bool)   # (device, is_live)
+    webrtc_connected = Signal()
+    webrtc_disconnected = Signal()
+    flash = Signal()
 
 
 class FlashWidget(QWidget):
@@ -41,8 +48,10 @@ class FlashWidget(QWidget):
         self.setAutoFillBackground(True)
 
     def flash(self):
-        screen = self.screen().geometry()
-        self.setGeometry(screen)
+        screen = self.screen()
+        if screen is None:
+            return
+        self.setGeometry(screen.geometry())
         self.showFullScreen()
         QTimer.singleShot(100, self.hide)
 
@@ -58,13 +67,22 @@ class MainWindow(QMainWindow):
         self._signals.progress.connect(self._on_progress)
         self._signals.done.connect(self._on_done)
         self._signals.error.connect(self._on_error)
+        self._signals.camera_probe_done.connect(self._on_camera_probe_done)
+        self._signals.webrtc_connected.connect(self._on_webrtc_connected)
+        self._signals.webrtc_disconnected.connect(self._on_webrtc_disconnected)
+        self._pending_probe: str = ""
 
         self._session: RecordingSession | None = None
         self._displays: list[Display] = []
         self._flash = FlashWidget()
+        self._signals.flash.connect(self._flash.flash)
+        self._webrtc: WebRTCServer | None = None
+        self._active_v4l2: str = ""
 
         self._build_ui()
         self._refresh_all()
+
+    # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
         central = QWidget()
@@ -73,7 +91,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        # Top bar
+        # ── top bar: display + camera selectors ──────────────────────────────
         top = QHBoxLayout()
         top.addWidget(QLabel("Display:"))
         self._display_combo = QComboBox()
@@ -95,7 +113,52 @@ class MainWindow(QMainWindow):
         top.addWidget(self._phone_label)
         root.addLayout(top)
 
-        # Preview area
+        # ── iPhone row: WebRTC connect ────────────────────────────────────────
+        iphone_row = QHBoxLayout()
+        self._iphone_btn = QPushButton("Connect iPhone")
+        self._iphone_btn.setFixedWidth(140)
+        self._iphone_btn.clicked.connect(self._on_iphone_btn)
+        iphone_row.addWidget(self._iphone_btn)
+
+        # Cert install URL (HTTP, first-time only)
+        self._cert_label = QLabel()
+        self._cert_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._cert_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #aaa;")
+        self._cert_label.hide()
+        iphone_row.addWidget(self._cert_label)
+
+        self._cert_copy_btn = QPushButton("Copy")
+        self._cert_copy_btn.setFixedWidth(48)
+        self._cert_copy_btn.clicked.connect(lambda: self._copy_url(self._cert_label, self._cert_copy_btn))
+        self._cert_copy_btn.hide()
+        iphone_row.addWidget(self._cert_copy_btn)
+
+        sep = QLabel("·")
+        sep.setStyleSheet("color: #555;")
+        self._iphone_sep = sep
+        sep.hide()
+        iphone_row.addWidget(sep)
+
+        # Camera URL (HTTPS, used every time)
+        self._cam_label = QLabel()
+        self._cam_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._cam_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #ccc;")
+        self._cam_label.hide()
+        iphone_row.addWidget(self._cam_label)
+
+        self._cam_copy_btn = QPushButton("Copy")
+        self._cam_copy_btn.setFixedWidth(48)
+        self._cam_copy_btn.clicked.connect(lambda: self._copy_url(self._cam_label, self._cam_copy_btn))
+        self._cam_copy_btn.hide()
+        iphone_row.addWidget(self._cam_copy_btn)
+
+        self._iphone_status = QLabel("—")
+        self._iphone_status.setStyleSheet("color: gray; margin-left: 8px;")
+        iphone_row.addWidget(self._iphone_status)
+        iphone_row.addStretch()
+        root.addLayout(iphone_row)
+
+        # ── preview area ──────────────────────────────────────────────────────
         self._preview_container = QWidget()
         self._preview_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._preview_container.setStyleSheet("background: #111;")
@@ -111,7 +174,7 @@ class MainWindow(QMainWindow):
         self._overlay.setGeometry(self._preview_container.rect())
         root.addWidget(self._preview_container, stretch=1)
 
-        # Controls
+        # ── record controls ───────────────────────────────────────────────────
         controls = QHBoxLayout()
         self._record_btn = QPushButton("Record")
         self._record_btn.setFixedHeight(40)
@@ -135,15 +198,17 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready")
 
-        # Screen preview timer
+        # Screen preview at 5 fps — fast enough to orient, slow enough to stay cheap
         self._preview_timer = QTimer()
         self._preview_timer.timeout.connect(self._update_screen_preview)
-        self._preview_timer.start(200)  # 5fps preview
+        self._preview_timer.start(200)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._overlay.setGeometry(self._preview_container.rect())
         self._overlay.place_default(self._preview_container.width(), self._preview_container.height())
+
+    # ── display / camera refresh ──────────────────────────────────────────────
 
     def _refresh_all(self):
         self._refresh_displays()
@@ -168,7 +233,19 @@ class MainWindow(QMainWindow):
     def _on_camera_selected(self, device: str):
         if not device:
             return
-        live = phone_capture.check_device_live(device)
+        self._pending_probe = device
+        self._phone_label.setText(f"Checking {device}…")
+        self._phone_label.setStyleSheet("color: gray;")
+        threading.Thread(
+            target=lambda: self._signals.camera_probe_done.emit(
+                device, phone_capture.check_device_live(device)
+            ),
+            daemon=True,
+        ).start()
+
+    def _on_camera_probe_done(self, device: str, live: bool):
+        if device != self._pending_probe:
+            return  # stale result
         if live:
             self._phone_label.setText(f"Live: {device}")
             self._phone_label.setStyleSheet("color: green;")
@@ -178,7 +255,9 @@ class MainWindow(QMainWindow):
             self._phone_label.setText(f"No feed: {device}")
             self._phone_label.setStyleSheet("color: orange;")
             self._overlay.stop()
-            self._active_v4l2 = None
+            self._active_v4l2 = ""
+
+    # ── screen preview ────────────────────────────────────────────────────────
 
     def _update_screen_preview(self):
         if not self._displays:
@@ -186,19 +265,19 @@ class MainWindow(QMainWindow):
         idx = self._display_combo.currentIndex()
         if idx < 0 or idx >= len(self._displays):
             return
-
-        from PySide6.QtWidgets import QApplication
-        screen = QApplication.primaryScreen()
         d = self._displays[idx]
-        if d.width > 0:
-            pixmap = screen.grabWindow(0, d.x, d.y, d.width, d.height)
-        else:
-            pixmap = screen.grabWindow(0)
-
+        if d.width == 0:  # Wayland sentinel — grabWindow not supported
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        pixmap = screen.grabWindow(0, d.x, d.y, d.width, d.height)
+        if pixmap.isNull():
+            return
         scaled = pixmap.scaled(
             self._screen_label.size(),
             Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.FastTransformation,
         )
         self._screen_label.setPixmap(scaled)
 
@@ -208,15 +287,110 @@ class MainWindow(QMainWindow):
             return self._displays[idx]
         return None
 
+    # ── iPhone / WebRTC ───────────────────────────────────────────────────────
+
+    def _on_iphone_btn(self):
+        if self._webrtc:
+            self._stop_webrtc()
+        else:
+            self._start_webrtc()
+
+    def _start_webrtc(self):
+        device = find_loopback_device()
+        if not device:
+            QMessageBox.warning(
+                self, "No loopback device",
+                "No v4l2loopback device found.\nRun: sudo modprobe v4l2loopback",
+            )
+            return
+        self._webrtc = WebRTCServer(device)
+        self._webrtc.on_connected = lambda: self._signals.webrtc_connected.emit()
+        self._webrtc.on_disconnected = lambda: self._signals.webrtc_disconnected.emit()
+        cert_url, camera_url = self._webrtc.start()
+
+        self._cert_label.setText(f"Trust cert (once): {cert_url}")
+        self._cam_label.setText(f"Open in Safari: {camera_url}")
+        for w in (self._cert_label, self._cert_copy_btn,
+                  self._iphone_sep, self._cam_label, self._cam_copy_btn):
+            w.show()
+
+        self._iphone_btn.setText("Disconnect")
+        self._iphone_status.setText("Waiting for iPhone…")
+        self._iphone_status.setStyleSheet("color: gray;")
+
+    def _on_webrtc_connected(self):
+        device = self._webrtc.v4l2_device if self._webrtc else ""
+        if not device:
+            return
+        # Bypass the probe — we know the device is live (ffmpeg is already writing)
+        self._pending_probe = ""
+        self._overlay.set_v4l2_device(device)
+        self._active_v4l2 = device
+        self._phone_label.setText(f"Live: {device}")
+        self._phone_label.setStyleSheet("color: green;")
+        self._iphone_status.setText("Connected ●")
+        self._iphone_status.setStyleSheet("color: #00c853;")
+        # Sync the camera combo without triggering a probe
+        devices = phone_capture.list_v4l2_devices()
+        self._camera_combo.blockSignals(True)
+        self._camera_combo.clear()
+        for dev in devices:
+            self._camera_combo.addItem(dev)
+        idx = self._camera_combo.findText(device)
+        if idx >= 0:
+            self._camera_combo.setCurrentIndex(idx)
+        self._camera_combo.blockSignals(False)
+
+    def _on_webrtc_disconnected(self):
+        self._iphone_status.setText("Disconnected")
+        self._iphone_status.setStyleSheet("color: orange;")
+        self._overlay.stop()
+        self._active_v4l2 = ""
+        self._phone_label.setText("Camera: —")
+        self._phone_label.setStyleSheet("")
+
+    def _stop_webrtc(self):
+        if self._webrtc:
+            srv = self._webrtc
+            self._webrtc = None
+            threading.Thread(target=srv.stop, daemon=True).start()
+        for w in (self._cert_label, self._cert_copy_btn,
+                  self._iphone_sep, self._cam_label, self._cam_copy_btn):
+            w.hide()
+        self._iphone_btn.setText("Connect iPhone")
+        self._iphone_status.setText("—")
+        self._iphone_status.setStyleSheet("color: gray;")
+        self._overlay.stop()
+        self._active_v4l2 = ""
+        self._phone_label.setText("Camera: —")
+        self._phone_label.setStyleSheet("")
+        QTimer.singleShot(300, self._refresh_cameras)
+
+    def _copy_url(self, label: QLabel, btn: QPushButton):
+        # Extract just the URL part (strip the descriptive prefix)
+        text = label.text()
+        url = text.split(": ", 1)[-1] if ": " in text else text
+        QApplication.clipboard().setText(url)
+        original = btn.text()
+        btn.setText("✓")
+        QTimer.singleShot(1500, lambda: btn.setText(original))
+
+    # ── recording ─────────────────────────────────────────────────────────────
+
     def _on_record(self):
         display = self._selected_display()
         if not display:
             QMessageBox.warning(self, "No display", "Select a display first.")
             return
-
-        if not getattr(self, "_active_v4l2", None):
-            QMessageBox.warning(self, "No camera", "No live camera feed found.\nStart OBS with the virtual camera enabled first.")
+        if not self._active_v4l2:
+            QMessageBox.warning(
+                self, "No camera",
+                "No live camera feed.\nConnect your iPhone using the button above.",
+            )
             return
+
+        # Stop preview before starting ffmpeg — both can't hold the v4l2 device
+        self._overlay.stop()
 
         self._session = RecordingSession(display, self._active_v4l2)
         self._session.overlay_box = self._overlay.overlay_box()
@@ -225,7 +399,7 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
-                self._session.start(flash_callback=self._flash.flash)
+                self._session.start(flash_callback=lambda: self._signals.flash.emit())
             except Exception as e:
                 self._signals.error.emit(str(e))
 
@@ -238,7 +412,7 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self._session.pause, daemon=True).start()
         else:
             threading.Thread(
-                target=lambda: self._session.resume(flash_callback=self._flash.flash),
+                target=lambda: self._session.resume(flash_callback=lambda: self._signals.flash.emit()),
                 daemon=True,
             ).start()
 
@@ -266,6 +440,12 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(recording or paused)
         self._pause_btn.setText("Resume" if paused else "Pause")
 
+        # Stop the OpenCV preview while ffmpeg is recording to avoid dual v4l2 consumer
+        if recording:
+            self._overlay.stop()
+        elif idle and self._active_v4l2:
+            self._overlay.set_v4l2_device(self._active_v4l2)
+
         if compositing:
             self._status_bar.showMessage("Processing…")
         elif recording:
@@ -287,3 +467,9 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"Error: {msg}")
         QMessageBox.critical(self, "Error", msg)
         self._session = None
+
+    def closeEvent(self, event):
+        self._preview_timer.stop()
+        self._overlay.stop()
+        event.accept()
+        QApplication.quit()

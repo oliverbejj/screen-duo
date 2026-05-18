@@ -4,6 +4,18 @@ import os
 import numpy as np
 
 
+def _has_audio_stream(video_path: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "audio" in result.stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
 def _extract_audio(video_path: str, wav_path: str, sample_rate: int = 44100):
     subprocess.run(
         [
@@ -74,7 +86,11 @@ def compute_offset(screen_path: str, phone_path: str) -> float:
     Return trim_phone - trim_screen in seconds.
     Positive means phone recording starts later → trim phone by this amount.
     Negative means screen recording starts later → trim screen by abs(value).
+    Returns 0.0 when phone recording has no audio (WebRTC pipeline is video-only).
     """
+    if not _has_audio_stream(phone_path):
+        return 0.0
+
     tmp_dir = tempfile.mkdtemp()
     phone_wav = os.path.join(tmp_dir, "phone.wav")
 
