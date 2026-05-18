@@ -1,10 +1,13 @@
+import os
 import threading
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -78,6 +81,11 @@ class MainWindow(QMainWindow):
         self._signals.flash.connect(self._flash.flash)
         self._webrtc: WebRTCServer | None = None
         self._active_v4l2: str = ""
+
+        self._record_elapsed: float = 0.0
+        self._seg_start: float = 0.0
+        self._elapsed_timer = QTimer()
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         self._build_ui()
         self._refresh_all()
@@ -192,6 +200,15 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._on_stop)
         controls.addWidget(self._stop_btn)
+
+        controls.addStretch()
+        self._timer_label = QLabel()
+        self._timer_label.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #e53935; min-width: 80px;"
+        )
+        self._timer_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._timer_label.hide()
+        controls.addWidget(self._timer_label)
         root.addLayout(controls)
 
         self._status_bar = QStatusBar()
@@ -440,11 +457,37 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(recording or paused)
         self._pause_btn.setText("Resume" if paused else "Pause")
 
-        # Stop the OpenCV preview while ffmpeg is recording to avoid dual v4l2 consumer
+        # Overlay: stop during recording, restart when idle
         if recording:
             self._overlay.stop()
         elif idle and self._active_v4l2:
             self._overlay.set_v4l2_device(self._active_v4l2)
+
+        # Recording timer
+        if recording:
+            self._seg_start = time.time()
+            self._elapsed_timer.start(500)
+            self._timer_label.setStyleSheet(
+                "font-size: 18px; font-weight: bold; color: #e53935; min-width: 80px;"
+            )
+            self._timer_label.show()
+        elif paused:
+            self._record_elapsed += time.time() - self._seg_start
+            self._elapsed_timer.stop()
+            self._timer_label.setStyleSheet(
+                "font-size: 18px; font-weight: bold; color: #f57c00; min-width: 80px;"
+            )
+            self._timer_label.setText(f"⏸ {self._fmt_elapsed(self._record_elapsed)}")
+        elif compositing:
+            if self._elapsed_timer.isActive():
+                self._record_elapsed += time.time() - self._seg_start
+            self._elapsed_timer.stop()
+            self._timer_label.setStyleSheet("font-size: 14px; color: #888; min-width: 80px;")
+            self._timer_label.setText("Processing…")
+        elif idle:
+            self._elapsed_timer.stop()
+            self._timer_label.hide()
+            self._record_elapsed = 0.0
 
         if compositing:
             self._status_bar.showMessage("Processing…")
@@ -455,15 +498,37 @@ class MainWindow(QMainWindow):
         elif idle:
             self._status_bar.showMessage("Ready")
 
+    def _update_elapsed(self):
+        total = self._record_elapsed + (time.time() - self._seg_start)
+        self._timer_label.setText(f"● {self._fmt_elapsed(total)}")
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        s = int(seconds)
+        return f"{s // 60:02d}:{s % 60:02d}"
+
     def _on_progress(self, msg: str):
         self._status_bar.showMessage(msg)
 
     def _on_done(self, path: str):
-        self._status_bar.showMessage(f"Saved: {path}")
-        QMessageBox.information(self, "Done", f"Recording saved to:\n{path}")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Recording", path, "MP4 Video (*.mp4)"
+        )
+        if save_path:
+            if not save_path.endswith(".mp4"):
+                save_path += ".mp4"
+            if save_path != path:
+                os.rename(path, save_path)
+            final = save_path
+        else:
+            final = path
+        self._status_bar.showMessage(f"Saved: {final}")
         self._session = None
 
     def _on_error(self, msg: str):
+        self._elapsed_timer.stop()
+        self._timer_label.hide()
+        self._record_elapsed = 0.0
         self._status_bar.showMessage(f"Error: {msg}")
         QMessageBox.critical(self, "Error", msg)
         self._session = None
