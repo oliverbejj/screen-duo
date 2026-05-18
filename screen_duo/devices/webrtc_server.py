@@ -21,6 +21,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from aiohttp import web
@@ -67,9 +68,10 @@ _HTML = """\
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1920 } },
+          video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1920 }, frameRate: { min: 25, ideal: 30 } },
           audio: false,
         });
+        stream.getTracks().forEach(t => { if (t.kind === 'video') t.contentHint = 'motion'; });
       } catch (e) { st.textContent = '❌ ' + e.message; return; }
       document.getElementById('v').srcObject = stream;
       st.textContent = 'Connecting…';
@@ -88,6 +90,7 @@ _HTML = """\
         const params = sender.getParameters();
         if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
         params.encodings[0].maxBitrate = 8_000_000; // 8 Mbps ceiling
+        params.encodings[0].maxFramerate = 30;
         try { await sender.setParameters(params); } catch (_) {}
       }
       let ans;
@@ -310,28 +313,62 @@ class WebRTCServer:
         )
 
     async def _consume(self, track) -> None:
+        """Read WebRTC frames and pump them into ffmpeg/v4l2loopback at a steady 30 fps.
+
+        WebRTC's temporal encoder skips frames when the scene is static, which
+        would otherwise starve v4l2loopback and make the preview/recording stall.
+        We decouple receipt from writing: a reader task grabs frames as they
+        arrive and stores the latest; a writer task ticks at 30 fps and repeats
+        the last frame whenever no new one has arrived yet.
+        """
+        loop = asyncio.get_running_loop()
         target_w: int | None = None
         target_h: int | None = None
-        while True:
-            try:
-                frame = await track.recv()
-            except Exception:
-                break
-            if target_w is None:
-                target_w, target_h = frame.width, frame.height
-                await asyncio.get_event_loop().run_in_executor(
-                    None, self._start_ffmpeg, target_w, target_h
-                )
-                if self.on_connected:
-                    self.on_connected()
-            if self._ffmpeg and self._ffmpeg.stdin:
+        last_data: bytes | None = None
+        active = True
+
+        async def _reader():
+            nonlocal target_w, target_h, last_data, active
+            while active:
                 try:
-                    data = frame.reformat(width=target_w, height=target_h, format="bgr24").to_ndarray().tobytes()
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, self._ffmpeg.stdin.write, data
-                    )
+                    frame = await track.recv()
+                except Exception:
+                    active = False
+                    return
+                if target_w is None:
+                    w, h = frame.width, frame.height
+                    # Cap at 1280 wide: keeps raw BGR24 frames ≤3.7 MB so the
+                    # stdin write doesn't block long enough to drop the rate to 3fps.
+                    if w > 1280:
+                        h = int(h * 1280 / w) & ~1
+                        w = 1280
+                    target_w, target_h = w, h
+                    await loop.run_in_executor(None, self._start_ffmpeg, target_w, target_h)
+                    if self.on_connected:
+                        self.on_connected()
+                last_data = frame.reformat(
+                    width=target_w, height=target_h, format="bgr24"
+                ).to_ndarray().tobytes()
+
+        async def _writer():
+            nonlocal active
+            while active:
+                await asyncio.sleep(1.0 / 30)
+                data = last_data
+                if not data or not self._ffmpeg or not self._ffmpeg.stdin:
+                    continue
+                try:
+                    await loop.run_in_executor(None, self._ffmpeg.stdin.write, data)
                 except (BrokenPipeError, OSError):
-                    break
+                    active = False
+
+        reader = asyncio.ensure_future(_reader())
+        writer = asyncio.ensure_future(_writer())
+        _, pending = await asyncio.wait([reader, writer], return_when=asyncio.FIRST_COMPLETED)
+        active = False
+        for t in pending:
+            t.cancel()
+
         self._stop_ffmpeg()
         if self.on_disconnected:
             self.on_disconnected()

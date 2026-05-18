@@ -3,7 +3,6 @@ import os
 import threading
 
 import cv2
-import numpy as np
 from PySide6.QtCore import Qt, QPoint, QRect, Signal, QObject
 from PySide6.QtGui import QImage, QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import QWidget
@@ -15,8 +14,6 @@ DEFAULT_BOX_H = 285  # 9:16 portrait — matches phone front camera
 MARGIN = 16
 HANDLE_SIZE = 10
 MIN_BOX = 80
-
-_PREVIEW_INTERVAL = 0.066  # ~15 fps
 
 
 @contextlib.contextmanager
@@ -34,7 +31,7 @@ def _suppress_av_log():
 
 
 class _FrameSignals(QObject):
-    frame_ready = Signal(object)
+    frame_ready = Signal(QImage)
 
 
 class OverlayWidget(QWidget):
@@ -49,9 +46,11 @@ class OverlayWidget(QWidget):
         self.setMouseTracking(True)
 
         self._box_rect = QRect(0, 0, DEFAULT_BOX_W, DEFAULT_BOX_H)
+        self._last_painted_rect = QRect()
         self._drag_offset = QPoint()
         self._dragging = False
-        self._phone_frame: np.ndarray | None = None
+        self._phone_frame: QImage | None = None
+        self._frame_pending = False  # True while a frame is queued but not yet painted
 
         self._resizing = False
         self._resize_handle = ""
@@ -66,6 +65,7 @@ class OverlayWidget(QWidget):
     def set_v4l2_device(self, device: str):
         self.stop()
         self._stop_event.clear()
+        self._frame_pending = False
         self._worker = threading.Thread(
             target=self._capture_loop, args=(device,), daemon=True
         )
@@ -77,6 +77,7 @@ class OverlayWidget(QWidget):
             self._worker.join(timeout=2.0)
             self._worker = None
         self._phone_frame = None
+        self._frame_pending = False
         self.update()
 
     def _capture_loop(self, device: str):
@@ -84,18 +85,33 @@ class OverlayWidget(QWidget):
             cap = cv2.VideoCapture(device)
         if not cap.isOpened():
             return
+        cap.set(cv2.CAP_PROP_FPS, 30)
         try:
             while not self._stop_event.is_set():
                 ok, frame = cap.read()
-                if ok:
-                    self._sigs.frame_ready.emit(frame)
-                self._stop_event.wait(_PREVIEW_INTERVAL)
+                if not ok:
+                    continue
+                if self._frame_pending:
+                    continue
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+                self._frame_pending = True
+                self._sigs.frame_ready.emit(qimg)
         finally:
             cap.release()
 
-    def _on_frame(self, frame: np.ndarray):
-        self._phone_frame = frame
-        self.update()
+    def _on_frame(self, qimg: QImage):
+        # Track the previous box so a drag/resize between frames clears the old region.
+        prev = QRect(self._last_painted_rect) if not self._last_painted_rect.isNull() else QRect()
+        self._phone_frame = qimg
+        self._frame_pending = False
+        # Only invalidate the box region (handles + size label live inside it) —
+        # repainting the whole overlay was the main paint cost.
+        dirty = QRect(self._box_rect)
+        if not prev.isNull() and prev != dirty:
+            dirty = dirty.united(prev)
+        self.update(dirty)
 
     def place_default(self, parent_w: int, parent_h: int):
         x = parent_w - DEFAULT_BOX_W - MARGIN
@@ -123,18 +139,17 @@ class OverlayWidget(QWidget):
 
     def paintEvent(self, _):
         painter = QPainter(self)
+        self._last_painted_rect = QRect(self._box_rect)
 
         if self._phone_frame is not None:
-            fh, fw = self._phone_frame.shape[:2]
+            iw, ih = self._phone_frame.width(), self._phone_frame.height()
             bw, bh = self._box_rect.width(), self._box_rect.height()
-            scale = min(bw / fw, bh / fh)
-            dw, dh = int(fw * scale), int(fh * scale)
+            scale = min(bw / iw, bh / ih)
+            dw, dh = int(iw * scale), int(ih * scale)
             dx = self._box_rect.x() + (bw - dw) // 2
             dy = self._box_rect.y() + (bh - dh) // 2
-            scaled = cv2.resize(self._phone_frame, (dw, dh))
-            rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
-            img = QImage(rgb.data, dw, dh, dw * 3, QImage.Format_RGB888).copy()
-            painter.drawImage(QRect(dx, dy, dw, dh), img)
+            # Qt scales the image to the target rect internally — no cv2 on the main thread
+            painter.drawImage(QRect(dx, dy, dw, dh), self._phone_frame)
 
         # Box border
         painter.setPen(QPen(QColor(255, 255, 255, 160), 1))

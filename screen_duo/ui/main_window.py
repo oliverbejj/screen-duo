@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         self._seg_start: float = 0.0
         self._elapsed_timer = QTimer()
         self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._preview_busy: bool = False
 
         self._build_ui()
         self._refresh_all()
@@ -215,7 +216,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready")
 
-        # Screen preview at 5 fps — fast enough to orient, slow enough to stay cheap
+        # Screen preview at 5 fps — grabWindow is expensive on Wayland (XWayland
+        # roundtrip + full-resolution copy), so we keep this rate low to leave
+        # the GUI thread free for the camera overlay paint events.
         self._preview_timer = QTimer()
         self._preview_timer.timeout.connect(self._update_screen_preview)
         self._preview_timer.start(200)
@@ -277,6 +280,10 @@ class MainWindow(QMainWindow):
     # ── screen preview ────────────────────────────────────────────────────────
 
     def _update_screen_preview(self):
+        # Skip if the previous grab is still running — prevents work piling up
+        # when grabWindow is slow (common on Wayland through XWayland).
+        if self._preview_busy:
+            return
         if not self._displays:
             return
         idx = self._display_combo.currentIndex()
@@ -288,15 +295,19 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen is None:
             return
-        pixmap = screen.grabWindow(0, d.x, d.y, d.width, d.height)
-        if pixmap.isNull():
-            return
-        scaled = pixmap.scaled(
-            self._screen_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.FastTransformation,
-        )
-        self._screen_label.setPixmap(scaled)
+        self._preview_busy = True
+        try:
+            pixmap = screen.grabWindow(0, d.x, d.y, d.width, d.height)
+            if pixmap.isNull():
+                return
+            scaled = pixmap.scaled(
+                self._screen_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
+            self._screen_label.setPixmap(scaled)
+        finally:
+            self._preview_busy = False
 
     def _selected_display(self):
         idx = self._display_combo.currentIndex()
@@ -466,16 +477,19 @@ class MainWindow(QMainWindow):
         # Recording timer
         if recording:
             self._seg_start = time.time()
-            self._elapsed_timer.start(500)
+            # 30 Hz keeps a label repaint cycling through GNOME's compositor,
+            # which prevents CPU governor + WiFi power-save from hitting deep idle
+            # (the same reason cursor movement used to "fix" choppy phone recording).
+            self._elapsed_timer.start(33)
             self._timer_label.setStyleSheet(
-                "font-size: 18px; font-weight: bold; color: #e53935; min-width: 80px;"
+                "font-size: 18px; font-weight: bold; color: #e53935; min-width: 100px;"
             )
             self._timer_label.show()
         elif paused:
             self._record_elapsed += time.time() - self._seg_start
             self._elapsed_timer.stop()
             self._timer_label.setStyleSheet(
-                "font-size: 18px; font-weight: bold; color: #f57c00; min-width: 80px;"
+                "font-size: 18px; font-weight: bold; color: #f57c00; min-width: 100px;"
             )
             self._timer_label.setText(f"⏸ {self._fmt_elapsed(self._record_elapsed)}")
         elif compositing:
@@ -505,7 +519,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
         s = int(seconds)
-        return f"{s // 60:02d}:{s % 60:02d}"
+        t = int((seconds - s) * 10)
+        return f"{s // 60:02d}:{s % 60:02d}.{t}"
 
     def _on_progress(self, msg: str):
         self._status_bar.showMessage(msg)
