@@ -1,9 +1,11 @@
+import io
 import os
 import threading
 import time
 
+import qrcode
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -166,6 +168,22 @@ class MainWindow(QMainWindow):
         iphone_row.addWidget(self._iphone_status)
         iphone_row.addStretch()
         root.addLayout(iphone_row)
+
+        # ── QR code row ───────────────────────────────────────────────────────
+        qr_row = QHBoxLayout()
+        self._qr_label = QLabel()
+        self._qr_label.setFixedSize(140, 140)
+        self._qr_label.setStyleSheet("background: white; border: 1px solid #333;")
+        self._qr_label.setAlignment(Qt.AlignCenter)
+        self._qr_label.hide()
+        qr_row.addWidget(self._qr_label)
+
+        self._qr_hint = QLabel("Scan in Safari to open camera")
+        self._qr_hint.setStyleSheet("color: #aaa; font-size: 11px; margin-left: 6px;")
+        self._qr_hint.hide()
+        qr_row.addWidget(self._qr_hint)
+        qr_row.addStretch()
+        root.addLayout(qr_row)
 
         # ── preview area ──────────────────────────────────────────────────────
         self._preview_container = QWidget()
@@ -346,6 +364,10 @@ class MainWindow(QMainWindow):
         self._iphone_status.setText("Waiting for iPhone…")
         self._iphone_status.setStyleSheet("color: gray;")
 
+        self._qr_label.setPixmap(self._make_qr_pixmap(camera_url))
+        self._qr_label.show()
+        self._qr_hint.show()
+
     def _on_webrtc_connected(self):
         device = self._webrtc.v4l2_device if self._webrtc else ""
         if not device:
@@ -392,7 +414,22 @@ class MainWindow(QMainWindow):
         self._active_v4l2 = ""
         self._phone_label.setText("Camera: —")
         self._phone_label.setStyleSheet("")
+        self._qr_label.hide()
+        self._qr_hint.hide()
         QTimer.singleShot(300, self._refresh_cameras)
+
+    @staticmethod
+    def _make_qr_pixmap(url: str, size: int = 140) -> QPixmap:
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        pixmap = QPixmap()
+        pixmap.loadFromData(buf.read())
+        return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _copy_url(self, label: QLabel, btn: QPushButton):
         # Extract just the URL part (strip the descriptive prefix)
@@ -420,7 +457,7 @@ class MainWindow(QMainWindow):
         # Stop preview before starting ffmpeg — both can't hold the v4l2 device
         self._overlay.stop()
 
-        self._session = RecordingSession(display, self._active_v4l2)
+        self._session = RecordingSession(display, self._active_v4l2, webrtc_server=self._webrtc)
         self._session.overlay_box = self._overlay.overlay_box()
         self._session.on_state_change = lambda s: self._signals.state_changed.emit(s)
         self._session.on_progress = lambda msg: self._signals.progress.emit(msg)

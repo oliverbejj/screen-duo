@@ -4,7 +4,7 @@ import os
 import numpy as np
 
 
-def _has_audio_stream(video_path: str) -> bool:
+def has_audio_stream(video_path: str) -> bool:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -88,7 +88,7 @@ def compute_offset(screen_path: str, phone_path: str) -> float:
     Negative means screen recording starts later → trim screen by abs(value).
     Returns 0.0 when phone recording has no audio (WebRTC pipeline is video-only).
     """
-    if not _has_audio_stream(phone_path):
+    if not has_audio_stream(phone_path):
         return 0.0
 
     tmp_dir = tempfile.mkdtemp()

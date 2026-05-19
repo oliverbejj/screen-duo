@@ -69,7 +69,7 @@ _HTML = """\
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1920 }, frameRate: { min: 25, ideal: 30 } },
-          audio: false,
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
         });
         stream.getTracks().forEach(t => { if (t.kind === 'video') t.contentHint = 'motion'; });
       } catch (e) { st.textContent = '❌ ' + e.message; return; }
@@ -228,6 +228,9 @@ class WebRTCServer:
         self._thread: threading.Thread | None = None
         self._pc: RTCPeerConnection | None = None
         self._ffmpeg: subprocess.Popen | None = None
+        self._audio_ffmpeg: subprocess.Popen | None = None
+        self._audio_sample_rate: int = 48000
+        self._audio_channels: int = 1
 
     def start(self) -> tuple[str, str]:
         """Start in a background thread. Returns (cert_url, camera_url)."""
@@ -239,12 +242,34 @@ class WebRTCServer:
         camera_url = f"https://{self._ip}:{self.https_port}"
         return cert_url, camera_url
 
+    def record_audio_to(self, path: str) -> None:
+        """Start saving phone mic audio to an AAC file. Call at segment start."""
+        self._stop_audio_ffmpeg()
+        self._audio_ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg", "-y",
+                "-f", "s16le",
+                "-ar", str(self._audio_sample_rate),
+                "-ac", str(self._audio_channels),
+                "-i", "pipe:0",
+                "-c:a", "aac", "-b:a", "128k",
+                path,
+            ],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def stop_audio_recording(self) -> None:
+        """Stop the current audio segment. Call at segment stop."""
+        self._stop_audio_ffmpeg()
+
     def stop(self) -> None:
         if self._loop and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
             self._thread.join(timeout=3)
         self._stop_ffmpeg()
+        self._stop_audio_ffmpeg()
 
     # ── async internals ───────────────────────────────────────────────────────
 
@@ -302,6 +327,8 @@ class WebRTCServer:
         async def on_track(track):
             if track.kind == "video":
                 asyncio.ensure_future(self._consume(track))
+            elif track.kind == "audio":
+                asyncio.ensure_future(self._consume_audio(track))
 
         await self._pc.setRemoteDescription(
             RTCSessionDescription(sdp=data["sdp"], type=data["type"])
@@ -373,6 +400,30 @@ class WebRTCServer:
         if self.on_disconnected:
             self.on_disconnected()
 
+    async def _consume_audio(self, track) -> None:
+        """Read WebRTC audio frames and pipe s16le PCM to ffmpeg when recording."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                frame = await track.recv()
+            except Exception:
+                break
+            # Store format info from first frame for record_audio_to()
+            if self._audio_sample_rate == 48000:  # still at default — update from frame
+                self._audio_sample_rate = frame.sample_rate
+                self._audio_channels = len(frame.layout.channels) if frame.layout.channels else 1
+            if not self._audio_ffmpeg:
+                continue
+            try:
+                frame = frame.reformat(format="s16", layout="mono")
+                data = bytes(frame.planes[0])
+            except Exception:
+                continue
+            try:
+                await loop.run_in_executor(None, self._audio_ffmpeg.stdin.write, data)
+            except (BrokenPipeError, OSError):
+                pass
+
     # ── ffmpeg subprocess ─────────────────────────────────────────────────────
 
     def _start_ffmpeg(self, width: int, height: int) -> None:
@@ -403,3 +454,18 @@ class WebRTCServer:
             self._ffmpeg.terminate()
             self._ffmpeg.wait()
         self._ffmpeg = None
+
+    def _stop_audio_ffmpeg(self) -> None:
+        if not self._audio_ffmpeg:
+            return
+        proc = self._audio_ffmpeg
+        self._audio_ffmpeg = None  # stop consumer from writing before we close stdin
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait()

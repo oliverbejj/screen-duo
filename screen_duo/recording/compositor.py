@@ -1,9 +1,10 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 
-from screen_duo.recording.sync import compute_offset, build_trim_args
+from screen_duo.recording.sync import compute_offset, build_trim_args, has_audio_stream
 
 
 @dataclass
@@ -14,35 +15,37 @@ class OverlayBox:
     height: int
 
 
-def _trim_and_concat(paths: list[str], trim_seconds: float, output_path: str):
-    """Concat video segments with optional leading trim, losslessly via ffmpeg concat."""
-    tmp_list = tempfile.mktemp(suffix=".txt")
-    with open(tmp_list, "w") as f:
-        for p in paths:
-            f.write(f"file '{p}'\n")
-
+def _trim_segment(input_path: str, trim_seconds: float, output_path: str):
+    """Copy or trim a single segment to output_path."""
     if trim_seconds > 0:
-        trimmed = tempfile.mktemp(suffix=".mp4")
-        # Concat first, then trim
         subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", tmp_list,
-             "-c", "copy", trimmed],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
-        )
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(trim_seconds), "-i", trimmed,
+            ["ffmpeg", "-y", "-ss", str(trim_seconds), "-i", input_path,
              "-c", "copy", output_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
         )
-        os.remove(trimmed)
     else:
         subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", tmp_list,
+            ["ffmpeg", "-y", "-i", input_path,
              "-c", "copy", output_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
         )
 
-    os.remove(tmp_list)
+
+def _concat_segments(paths: list[str], output_path: str):
+    """Losslessly concatenate segments via ffmpeg concat demuxer."""
+    fd, tmp_list = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for p in paths:
+                f.write(f"file '{p}'\n")
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", tmp_list,
+             "-c", "copy", output_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+    finally:
+        if os.path.exists(tmp_list):
+            os.remove(tmp_list)
 
 
 def composite(
@@ -50,56 +53,141 @@ def composite(
     phone_segments: list[str],
     box: OverlayBox,
     output_path: str,
+    mic_segments: list[str] | None = None,
+    phone_audio_segments: list[str | None] | None = None,
     progress_callback=None,
 ) -> str:
     """
-    Sync segments, apply face-tracked crop to phone feed, overlay on screen, write output.
+    Sync segments, overlay phone feed on screen, write output.
+
+    Audio source priority: phone_audio_segments (WebRTC mic) > mic_segments
+    (GNOME laptop mic) > embedded screen audio.
+
+    On GNOME Wayland, phone video and mic both start before the D-Bus handshake,
+    so they record T_gnome extra content compared to screen. The mic offset measures
+    T_gnome; we apply it to phone video too (they start at the same wall-clock time).
+    When phone audio is available it measures the same offset directly, so no proxy
+    needed.
+
     Returns the output path.
     """
+    if len(screen_segments) != len(phone_segments):
+        raise ValueError(
+            f"segment count mismatch: {len(screen_segments)} screen vs {len(phone_segments)} phone"
+        )
     tmp_dir = tempfile.mkdtemp()
+    try:
+        n = len(screen_segments)
 
-    if progress_callback:
-        progress_callback("Computing sync offset…")
+        screen_trimmed: list[str] = []
+        phone_trimmed: list[str] = []
+        mic_trimmed: list[str | None] = []
+        phone_audio_trimmed: list[str | None] = []
 
-    offset = compute_offset(screen_segments[0], phone_segments[0])
-    screen_trim, phone_trim = build_trim_args(offset)
+        for i, (screen_seg, phone_seg) in enumerate(zip(screen_segments, phone_segments)):
+            if progress_callback:
+                progress_callback(f"Syncing segment {i + 1} of {n}…")
 
-    if progress_callback:
-        progress_callback("Concatenating screen segments…")
+            mic_path = (mic_segments or [])[i] if mic_segments and i < len(mic_segments) else None
+            mic_valid = bool(mic_path and os.path.exists(mic_path) and os.path.getsize(mic_path) > 0)
 
-    screen_full = os.path.join(tmp_dir, "screen_full.mp4")
-    _trim_and_concat(screen_segments, screen_trim, screen_full)
+            phone_audio_path = (
+                (phone_audio_segments or [])[i]
+                if phone_audio_segments and i < len(phone_audio_segments)
+                else None
+            )
+            phone_audio_valid = bool(
+                phone_audio_path
+                and os.path.exists(phone_audio_path)
+                and os.path.getsize(phone_audio_path) > 0
+                and has_audio_stream(phone_audio_path)
+            )
 
-    if progress_callback:
-        progress_callback("Concatenating phone segments…")
+            screen_out = os.path.join(tmp_dir, f"screen_trimmed_{i}.mp4")
+            phone_out = os.path.join(tmp_dir, f"phone_trimmed_{i}.mp4")
 
-    phone_full = os.path.join(tmp_dir, "phone_full.mp4")
-    _trim_and_concat(phone_segments, phone_trim, phone_full)
+            # Compute mic offset once — measures the GNOME handshake delay (T_gnome)
+            # because mic and phone both start before the D-Bus handshake completes.
+            mic_sync = 0.0
+            if mic_valid:
+                mic_sync = max(0.0, compute_offset(screen_seg, mic_path))
 
-    if progress_callback:
-        progress_callback("Compositing final video…")
+            # Phone video sync: prefer phone audio (direct clapper detection); fall
+            # back to mic_sync as a proxy when phone has no audio stream.
+            if phone_audio_valid:
+                raw = compute_offset(screen_seg, phone_audio_path)
+                screen_trim, phone_trim = build_trim_args(raw)
+            else:
+                offset = compute_offset(screen_seg, phone_seg)  # 0.0 if no audio in phone
+                screen_trim, phone_trim = build_trim_args(offset)
+                if phone_trim == 0.0 and mic_sync > 0.0:
+                    phone_trim = mic_sync
 
-    bw, bh = box.width, box.height
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", screen_full,
-            "-i", phone_full,
+            _trim_segment(screen_seg, screen_trim, screen_out)
+            _trim_segment(phone_seg, phone_trim, phone_out)
+            screen_trimmed.append(screen_out)
+            phone_trimmed.append(phone_out)
+
+            # Mic trim
+            if mic_valid:
+                mic_out = os.path.join(tmp_dir, f"mic_trimmed_{i}.m4a")
+                _trim_segment(mic_path, mic_sync, mic_out)
+                mic_trimmed.append(mic_out)
+            else:
+                mic_trimmed.append(None)
+
+            # Phone audio trim (same offset as phone video to stay in sync)
+            if phone_audio_valid:
+                phone_audio_out = os.path.join(tmp_dir, f"phone_audio_trimmed_{i}.m4a")
+                _trim_segment(phone_audio_path, phone_trim, phone_audio_out)
+                phone_audio_trimmed.append(phone_audio_out)
+            else:
+                phone_audio_trimmed.append(None)
+
+        if progress_callback:
+            progress_callback("Concatenating screen segments…")
+        screen_full = os.path.join(tmp_dir, "screen_full.mp4")
+        _concat_segments(screen_trimmed, screen_full)
+
+        if progress_callback:
+            progress_callback("Concatenating phone segments…")
+        phone_full = os.path.join(tmp_dir, "phone_full.mp4")
+        _concat_segments(phone_trimmed, phone_full)
+
+        valid_phone_audios = [m for m in phone_audio_trimmed if m]
+        phone_audio_full = None
+        if len(valid_phone_audios) == n and n > 0:
+            phone_audio_full = os.path.join(tmp_dir, "phone_audio_full.m4a")
+            _concat_segments(valid_phone_audios, phone_audio_full)
+
+        valid_mics = [m for m in mic_trimmed if m]
+        mic_full = None
+        if len(valid_mics) == n and n > 0:
+            mic_full = os.path.join(tmp_dir, "mic_full.m4a")
+            _concat_segments(valid_mics, mic_full)
+
+        if progress_callback:
+            progress_callback("Compositing final video…")
+
+        # Audio priority: phone mic > laptop mic > embedded screen audio
+        audio_source = phone_audio_full or mic_full
+
+        bw, bh = box.width, box.height
+        cmd = ["ffmpeg", "-y", "-i", screen_full, "-i", phone_full]
+        if audio_source:
+            cmd += ["-i", audio_source]
+        cmd += [
             "-filter_complex",
             f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
-            f"crop={bw}:{bh}[phone];[0:v][phone]overlay={box.x}:{box.y}",
+            f"crop={bw}:{bh}[phone];[0:v][phone]overlay={box.x}:{box.y}[out]",
+            "-map", "[out]",
+            "-map", f"{'2:a' if audio_source else '0:a?'}",
             "-c:v", "libx264", "-preset", "slow", "-crf", "17",
             "-c:a", "copy",
             output_path,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    for f in [screen_full, phone_full]:
-        if os.path.exists(f):
-            os.remove(f)
-    os.rmdir(tmp_dir)
-
-    return output_path
+        return output_path
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

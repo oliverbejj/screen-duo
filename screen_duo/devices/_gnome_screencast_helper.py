@@ -26,6 +26,10 @@ def main() -> int:
         area_mode = False
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    # TODO: GNOME screencast audio not yet supported
+    # The org.gnome.Shell.Screencast D-Bus API records video only; it does not
+    # expose an audio option. A separate PulseAudio capture subprocess would be
+    # needed and would require muxing at compositing time — deferred for now.
     options = {
         "framerate": GLib.Variant("u", framerate),
         "draw-cursor": GLib.Variant("b", True),

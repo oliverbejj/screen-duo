@@ -1,4 +1,5 @@
 import os
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -18,7 +19,7 @@ class State(Enum):
 
 
 class RecordingSession:
-    def __init__(self, display, v4l2_device: str):
+    def __init__(self, display, v4l2_device: str, webrtc_server=None):
         self.display = display
         self.v4l2_device = v4l2_device
         self.state = State.IDLE
@@ -26,7 +27,10 @@ class RecordingSession:
         self._session_dir = self._make_session_dir()
         self._screen_segments: list[str] = []
         self._phone_segments: list[str] = []
+        self._mic_segments: list[str] = []
+        self._phone_audio_segments: list[str | None] = []
         self._segment_index = 0
+        self._webrtc = webrtc_server
 
         self._screen_proc = None
         self._phone_proc = None
@@ -47,6 +51,9 @@ class RecordingSession:
 
     def _start_segment(self, flash_callback=None):
         screen_path, phone_path = self._segment_paths(self._segment_index)
+        phone_audio_path = os.path.join(
+            self._session_dir, f"phone_{self._segment_index}_audio.m4a"
+        )
 
         # Start both as close together as possible
         started = threading.Barrier(2)
@@ -58,6 +65,8 @@ class RecordingSession:
         def start_phone():
             started.wait()
             self._phone_proc = phone_capture.start_recording(self.v4l2_device, phone_path)
+            if self._webrtc:
+                self._webrtc.record_audio_to(phone_audio_path)
 
         t1 = threading.Thread(target=start_screen)
         t2 = threading.Thread(target=start_phone)
@@ -72,6 +81,8 @@ class RecordingSession:
 
         self._screen_segments.append(screen_path)
         self._phone_segments.append(phone_path)
+        self._mic_segments.append(screen_path.replace(".mp4", "_mic.m4a"))
+        self._phone_audio_segments.append(phone_audio_path if self._webrtc else None)
 
     def _stop_segment(self):
         def stop_screen():
@@ -83,6 +94,8 @@ class RecordingSession:
             if self._phone_proc:
                 phone_capture.stop_recording(self._phone_proc)
                 self._phone_proc = None
+            if self._webrtc:
+                self._webrtc.stop_audio_recording()
 
         t1 = threading.Thread(target=stop_screen)
         t2 = threading.Thread(target=stop_phone)
@@ -129,8 +142,13 @@ class RecordingSession:
             self._phone_segments,
             self.overlay_box,
             output_path,
+            mic_segments=self._mic_segments,
+            phone_audio_segments=self._phone_audio_segments,
             progress_callback=self.on_progress,
         )
+
+        if os.path.exists(output_path):
+            shutil.rmtree(self._session_dir, ignore_errors=True)
 
         self.state = State.IDLE
         if self.on_state_change:

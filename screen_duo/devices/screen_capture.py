@@ -100,11 +100,17 @@ def _start_x11(display: Display, output_path: str, framerate: int) -> subprocess
     xdisplay = os.environ.get("DISPLAY", ":0")
     cmd = [
         "ffmpeg", "-y",
+        "-thread_queue_size", "1024",
         "-f", "x11grab",
         "-framerate", str(framerate),
         "-video_size", f"{display.width}x{display.height}",
         "-i", f"{xdisplay}.0+{display.x},{display.y}",
+        "-thread_queue_size", "1024",
+        "-f", "pulse",
+        "-i", "default",
+        "-map", "0:v", "-map", "1:a",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -115,15 +121,69 @@ _SCREENCAST_PATH = "/org/gnome/Shell/Screencast"
 _HELPER_SCRIPT = os.path.join(os.path.dirname(__file__), "_gnome_screencast_helper.py")
 
 
+class _MicRecorder:
+    """Records mic audio to a separate AAC file via ffmpeg + PulseAudio.
+
+    Used alongside GNOME Screencast, whose D-Bus API captures video only.
+    Failures are suppressed so a missing/blocked mic never kills the recording.
+    """
+
+    def __init__(self, output_path: str):
+        self.path = output_path
+        try:
+            self._proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-y",
+                    "-thread_queue_size", "1024",
+                    "-f", "pulse", "-i", "default",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path,
+                ],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, FileNotFoundError):
+            self._proc = None
+
+    def stop(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.write(b"q")
+            self._proc.stdin.flush()
+        except (OSError, BrokenPipeError):
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+            self._proc.wait()
+
+    def valid(self) -> bool:
+        """True if the file exists and is non-empty after stop()."""
+        return bool(
+            self._proc is not None
+            and os.path.exists(self.path)
+            and os.path.getsize(self.path) > 0
+        )
+
+
 class _GnomeScreencast:
     """Handle for a recording driven by the org.gnome.Shell.Screencast D-Bus
     API. GNOME stops the recording when the caller's D-Bus connection vanishes,
     so a helper subprocess holds that connection open for the segment's life."""
 
-    def __init__(self, proc: subprocess.Popen, requested_path: str, actual_path: str):
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        requested_path: str,
+        actual_path: str,
+        mic: _MicRecorder | None = None,
+    ):
         self._proc = proc
         self._requested_path = requested_path
         self._actual_path = actual_path
+        self._mic = mic
 
     def stop(self) -> None:
         try:
@@ -139,6 +199,8 @@ class _GnomeScreencast:
             self._proc.wait()
         if self._actual_path != self._requested_path and os.path.exists(self._actual_path):
             os.replace(self._actual_path, self._requested_path)
+        if self._mic:
+            self._mic.stop()
 
 
 _gi_python: str | None | bool = False  # False = not yet probed
@@ -193,22 +255,26 @@ def _start_gnome_screencast(display: Display, output_path: str, framerate: int) 
         # Area mode: record only the selected monitor's region
         args += [str(display.x), str(display.y), str(display.width), str(display.height)]
     args.append(str(framerate))
+    # Start mic before the D-Bus handshake so it is definitely running before
+    # the clapper fires; the compositor uses the beep→flash offset to trim it.
+    mic = _MicRecorder(output_path.replace(".mp4", "_mic.m4a"))
     proc = subprocess.Popen(
         args,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     line = proc.stdout.readline().decode(errors="replace").strip()
     if not line.startswith("OK "):
+        mic.stop()
         proc.terminate()
         raise RuntimeError(f"GNOME screencast failed to start: {line or 'no response'}")
-    return _GnomeScreencast(proc, output_path, line[3:])
+    return _GnomeScreencast(proc, output_path, line[3:], mic=mic)
 
 
 def _start_wayland(display: Display, output_path: str, framerate: int):
     if _gnome_screencast_available():
         return _start_gnome_screencast(display, output_path, framerate)
     # wf-recorder works on wlroots compositors (Sway, Hyprland), not GNOME.
-    cmd = ["wf-recorder", "--codec", "libx264", "-f", output_path]
+    cmd = ["wf-recorder", "--codec", "libx264", "--audio", "-f", output_path]
     # Pass the output name when it's a real connector (not an XWayland alias)
     if display.name and not display.name.startswith("XWAYLAND"):
         cmd += ["--output", display.name]
