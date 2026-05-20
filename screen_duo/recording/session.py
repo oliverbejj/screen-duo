@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 
-from screen_duo.devices import screen_capture, phone_capture
+from screen_duo.devices import screen_capture, phone_capture, wifi_powersave
 from screen_duo.recording import clapper, compositor
 from screen_duo.recording.compositor import OverlayBox
 
@@ -107,6 +107,7 @@ class RecordingSession:
     def start(self, flash_callback=None):
         assert self.state == State.IDLE
         assert self.overlay_box is not None
+        wifi_powersave.disable()
         self._start_segment(flash_callback)
         self.state = State.RECORDING
         if self.on_state_change:
@@ -150,6 +151,7 @@ class RecordingSession:
         if os.path.exists(output_path):
             shutil.rmtree(self._session_dir, ignore_errors=True)
 
+        wifi_powersave.enable()
         self.state = State.IDLE
         if self.on_state_change:
             self.on_state_change(self.state)

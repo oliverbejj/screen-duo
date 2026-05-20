@@ -14,17 +14,18 @@ The project is split into three layers:
 
 **1. Device layer** (`devices/`)
 
-- `screen_capture.py` — captures the selected display. Auto-detects X11 (ffmpeg `x11grab`) vs Wayland (`$WAYLAND_DISPLAY`). On Wayland it further branches: GNOME/Mutter uses the `org.gnome.Shell.Screencast` D-Bus API (Mutter does not implement `wlr-screencopy`, so `wf-recorder` cannot work there); wlroots compositors (Sway, Hyprland) use `wf-recorder`.
+- `screen_capture.py` — captures the selected display. Auto-detects X11 (ffmpeg `x11grab`, with PulseAudio mic) vs Wayland (`$WAYLAND_DISPLAY`). On Wayland it further branches: GNOME/Mutter uses the `org.gnome.Shell.Screencast` D-Bus API (Mutter does not implement `wlr-screencopy`, so `wf-recorder` cannot work there); wlroots compositors (Sway, Hyprland) use `wf-recorder --audio`. The GNOME path also starts a `_MicRecorder` (separate ffmpeg/PulseAudio process) before the D-Bus handshake so the laptop mic is rolling before the clapper fires — this mic file is used for sync and as an audio fallback.
 - `phone_capture.py` — probes and lists `/dev/video`* devices, checks if a device has a live feed, and records from a v4l2 device to a file via ffmpeg. Does not control any hardware directly; it reads whatever is already on the v4l2 device.
-- `webrtc_server.py` — the iPhone camera bridge. Runs a two-port local server: HTTP on :8080 (serves a `.mobileconfig` CA cert profile for one-time installation on the iPhone) and HTTPS on :8443 (serves the WebRTC camera page). Received frames are piped from aiortc into a v4l2loopback device via ffmpeg subprocess.
+- `webrtc_server.py` — the iPhone camera + mic bridge. Runs a two-port local server: HTTP on :8080 (serves a `.mobileconfig` CA cert profile for one-time installation on the iPhone) and HTTPS on :8443 (serves the WebRTC camera page). Video frames are piped from aiortc into a v4l2loopback device via ffmpeg. Audio frames are decoded by aiortc and piped as s16le PCM to a separate ffmpeg process during recording segments (`record_audio_to(path)` / `stop_audio_recording()`). Echo cancellation / noise suppression / AGC are disabled so the clapper beep reaches the phone mic for sync detection.
 - `iphone_bridge.py` — fallback RTSP/MJPEG/RTMP bridge. Detects the v4l2loopback device and starts an ffmpeg process piping any URL stream into it. Not used by the main UI (which uses WebRTC), but available as a utility.
+- `wifi_powersave.py` — disables WiFi PSM (`iw dev <iface> set power_save off`) at recording start and restores it at stop. Requires `/etc/sudoers.d/screen-duo-wifi` (NOPASSWD rule for the iw command). Without this, 802.11 power management batches UDP packets in ~300 ms bursts during idle, dropping WebRTC fps to ~3.
 
 **2. Recording layer** (`recording/`)
 
-- `session.py` — orchestrates a recording session. Manages segments (pause = stop both feeds simultaneously, resume = start new segment pair). Uses simultaneous ffmpeg triggers for sync.
-- `sync.py` — post-recording sync correction. At the start of each segment, a clapper flash is shown on screen and a beep plays through the phone speaker. `sync.py` finds these markers in each segment pair to compute drift and align them.
-- `compositor.py` — post-recording ffmpeg compositing. Concatenates segments (lossless via `concat` demuxer), then overlays the phone feed on the screen recording. Output: H.264/MP4.
-- `clapper.py` — triggers the clapper flash (full-screen white `FlashWidget`) and audio beep.
+- `session.py` — orchestrates a recording session. Manages segments (pause = stop both feeds simultaneously, resume = start new segment pair). Uses simultaneous ffmpeg triggers for sync. Accepts an optional `webrtc_server` reference and calls `record_audio_to` / `stop_audio_recording` at segment boundaries to capture phone mic audio.
+- `sync.py` — post-recording sync correction. At the start of each segment a clapper flash is shown on screen and a beep plays through the laptop speaker. `sync.py` finds these markers to compute drift: `_find_screen_flash` scans the screen video for the white frame; `_find_audio_spike` finds the beep onset in any audio file (phone mic or laptop mic).
+- `compositor.py` — post-recording ffmpeg compositing. Per-segment sync loop: (1) find mic/phone-audio offset (clapper beep vs screen flash) to correct for GNOME D-Bus handshake pre-roll, (2) trim all streams, (3) losslessly concat via `concat` demuxer, (4) ffmpeg overlay + encode. Audio priority: phone mic (WebRTC) > laptop mic (GNOME `_MicRecorder`) > embedded screen audio.
+- `clapper.py` — triggers the clapper flash (full-screen white `FlashWidget`) and a 1 kHz audio beep via `paplay`/`aplay`.
 
 **3. UI layer** (`ui/`)
 
