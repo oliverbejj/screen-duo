@@ -1,5 +1,4 @@
 import os
-import shutil
 import threading
 import time
 from datetime import datetime
@@ -137,28 +136,25 @@ class RecordingSession:
         if self.on_state_change:
             self.on_state_change(self.state)
 
-        output_path = self._output_path()
+        tmp_path = os.path.join(self._session_dir, "output.mp4")
         compositor.composite(
             self._screen_segments,
             self._phone_segments,
             self.overlay_box,
-            output_path,
+            tmp_path,
             mic_segments=self._mic_segments,
             phone_audio_segments=self._phone_audio_segments,
             progress_callback=self.on_progress,
         )
-
-        if os.path.exists(output_path):
-            shutil.rmtree(self._session_dir, ignore_errors=True)
 
         wifi_powersave.enable()
         self.state = State.IDLE
         if self.on_state_change:
             self.on_state_change(self.state)
 
-        return output_path
+        return tmp_path
 
-    def _output_path(self) -> str:
+    def suggested_save_path(self) -> str:
         out_dir = Path.home() / "Videos" / "screen-duo"
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")

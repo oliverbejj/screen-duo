@@ -562,18 +562,21 @@ class MainWindow(QMainWindow):
     def _on_progress(self, msg: str):
         self._status_bar.showMessage(msg)
 
-    def _on_done(self, path: str):
+    def _on_done(self, tmp_path: str):
+        import shutil
+        session_dir = os.path.dirname(tmp_path)
+        suggested = self._session.suggested_save_path() if self._session else tmp_path
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Recording", path, "MP4 Video (*.mp4)"
+            self, "Save Recording", suggested, "MP4 Video (*.mp4)"
         )
         if save_path:
             if not save_path.endswith(".mp4"):
                 save_path += ".mp4"
-            if save_path != path:
-                os.rename(path, save_path)
+            shutil.move(tmp_path, save_path)
+            shutil.rmtree(session_dir, ignore_errors=True)
             final = save_path
         else:
-            final = path
+            final = tmp_path
         self._status_bar.showMessage(f"Saved: {final}")
         self._session = None
 
